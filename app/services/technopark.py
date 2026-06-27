@@ -1,6 +1,6 @@
 import re
 import logging
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, unquote_plus
 
 import httpx
 
@@ -49,11 +49,38 @@ async def fetch_detail(stub: dict, client: httpx.AsyncClient) -> dict:
     h1 = soup.find("h1")
     title = h1.get_text(strip=True) if h1 else stub["title"]
 
+    # ── Company ──────────────────────────────────────────────────────────────
+    # FIX: the page has TWO <a> tags pointing to /company-details/<id> — one
+    # wraps the logo <img> (empty text), one wraps the company name text.
+    # soup.find() returns whichever appears first in the DOM, which is usually
+    # the image link, so `company` ended up "". We now scan ALL matches and
+    # take the first one with non-empty text, falling back to decoding the
+    # name straight out of the `company=` query parameter (always present),
+    # and finally to a nearby heading tag as a last resort.
     company, company_url = None, None
-    company_link = soup.find("a", href=re.compile(r"/company-details/\d+"))
-    if company_link:
-        company = company_link.get_text(strip=True)
-        company_url = urljoin(settings.technopark_base, company_link["href"])
+    company_links = soup.find_all("a", href=re.compile(r"/company-details/\d+"))
+
+    for link in company_links:
+        href = link["href"]
+        if company_url is None:
+            company_url = urljoin(settings.technopark_base, href)
+        link_text = link.get_text(strip=True)
+        if link_text:
+            company = link_text
+            company_url = urljoin(settings.technopark_base, href)
+            break
+
+    if not company and company_links:
+        qs = parse_qs(urlparse(company_links[0]["href"]).query)
+        if "company" in qs:
+            company = unquote_plus(qs["company"][0]).strip()
+
+    if not company:
+        for tag in soup.find_all(["h2", "h3"]):
+            candidate = tag.get_text(strip=True)
+            if candidate and candidate.lower() != title.lower():
+                company = candidate
+                break
 
     location = None
     loc_match = re.search(
