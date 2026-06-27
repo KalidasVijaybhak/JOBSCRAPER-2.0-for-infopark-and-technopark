@@ -1,7 +1,6 @@
 import re
-import asyncio
 import logging
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode
 
 import httpx
 
@@ -11,7 +10,7 @@ from app.utils.http import fetch_soup, split_emails
 logger = logging.getLogger(__name__)
 
 
-# ── Boilerplate stripping (unchanged from previous fix) ─────────────────────
+# ── Boilerplate stripping (unchanged) ────────────────────────────────────────
 _HEADER_START_RE = re.compile(r"^\s*Home\s*\n?\s*About\b", re.I)
 _FOOTER_START_RE = re.compile(
     r"About Infopark\s*\n\s*Overview\s*\n\s*Governing Body\s*\n\s*Executive Council",
@@ -70,18 +69,25 @@ def _strip_boilerplate(raw: str) -> str:
 
 
 # ── Listing ───────────────────────────────────────────────────────────────────
-# Infopark moved the job board from /companies/job-search?search=<term> to
-# /companies-job (paginated via ?page=N) and the `search` query param is no
-# longer honored server-side — every page renders the same unfiltered list
-# regardless of what `search` is set to. The page also has no working HTML
-# search form; filtering is JS-only on the client.
+# /companies/job-search?search=<term> IS the correct, working endpoint — this
+# was confirmed by directly testing it: search=ai returns a results page
+# containing only AI-related job titles (AI Engineer, Agentic AI Architect,
+# etc.), correctly filtered server-side.
 #
-# Fix: paginate through /companies-job ourselves and filter by keyword against
-# the job title AND company name in Python, the same approach already used
-# for Technopark's /job-crawl page.
+# HOWEVER, the same endpoint is unreliable for some other terms (observed:
+# search=python, search=java, search=react all silently drop the `search`
+# param server-side and redirect to the generic unfiltered listing instead of
+# raising an error). This looks like a caching/routing bug on Infopark's end
+# rather than the endpoint having moved — it is NOT consistent across terms.
+#
+# To handle this robustly without guessing which terms are "safe": we always
+# try the server-side search first (cheap — one request), and only fall back
+# to manually paginating + filtering ourselves if we can detect the server
+# silently ignored our keyword.
 
-LISTING_PATH = "/companies-job"
-MAX_PAGES_TO_SCAN = 30  # site currently has ~27 pages; cap as a safety bound
+SEARCH_PATH = "/companies/job-search"
+LISTING_PATH = "/companies/job-search"  # same path, paginated via ?page=N
+MAX_PAGES_TO_SCAN = 30
 
 
 def _parse_listing_page(soup) -> tuple[list[dict], bool]:
@@ -105,29 +111,35 @@ def _parse_listing_page(soup) -> tuple[list[dict], bool]:
             "detail_path": link["href"],
         })
 
-    # Determine if there's a next page. IMPORTANT: the pager shows numbered
-    # links back to EARLIER pages even when viewing the LAST page (e.g. on
-    # page 27 of 27, you still see links to pages 1-26), so checking for "any
-    # link matching ?page=\d+" is unreliable and never correctly detects the
-    # end. Instead we check specifically for the "›" (next) arrow being an
-    # active link with an href — on the last page it renders as plain text
-    # with no href, on every other page it's a real link to page+1.
+    # The pager shows numbered links back to earlier pages even on the LAST
+    # page, so "any ?page=N link present" is not a reliable end-of-list
+    # signal. We specifically look for an active "›" (next) link instead —
+    # on the true last page it renders as plain text with no href.
     has_more = False
-    for a in soup.find_all("a", href=re.compile(r"companies-job(\?page=\d+)?$")):
-        label = a.get_text(strip=True)
-        if label in ("›", "»", "next", "Next"):
+    for a in soup.find_all("a", href=re.compile(r"job-search(\?page=\d+)?$")):
+        if a.get_text(strip=True) in ("›", "»", "next", "Next"):
             has_more = True
             break
     return jobs, has_more
 
 
-async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
+def _results_look_filtered(jobs: list[dict], keyword: str) -> bool:
     """
-    Fetch ALL pages of /companies-job and filter rows whose job title or
-    company name contains the search keyword (case-insensitive substring).
-    Stops early once a page with no matching jobs AND no next-page link is
-    reached, or once MAX_PAGES_TO_SCAN is hit.
+    Heuristic check for whether the server actually applied our search filter.
+    If at least one job's title or company doesn't contain the keyword, the
+    server is very likely returning the generic unfiltered list rather than
+    real search results (a true filtered result set should have every row
+    matching). Empty result sets are NOT treated as failure — a real search
+    can legitimately return zero matches.
     """
+    if not jobs:
+        return True  # zero results is a valid filtered outcome, not a failure
+    keyword = keyword.lower()
+    return all(keyword in f"{j['title']} {j['company']}".lower() for j in jobs)
+
+
+async def _paginate_and_filter(search: str, client: httpx.AsyncClient) -> list[dict]:
+    """Fallback: manually walk every listing page and filter client-side."""
     keyword = search.lower().strip()
     matched: list[dict] = []
     seen_job_ids: set[str] = set()
@@ -142,12 +154,12 @@ async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
         try:
             soup = await fetch_soup(url, client)
         except httpx.HTTPStatusError as e:
-            logger.warning(f"Infopark listing page {page} failed: {e}")
+            logger.warning(f"Infopark fallback listing page {page} failed: {e}")
             break
 
         jobs, has_more = _parse_listing_page(soup)
         if not jobs:
-            break  # ran past the last page
+            break
 
         for job in jobs:
             if job["job_id"] in seen_job_ids:
@@ -162,6 +174,32 @@ async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
         page += 1
 
     return matched
+
+
+async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Search for jobs by keyword. Tries the server-side search endpoint first
+    (fast — one request); if the response shows signs the server ignored our
+    `search` param (returned the generic unfiltered list instead), falls back
+    to paginating the listing ourselves and filtering client-side.
+    """
+    url = f"{settings.infopark_base}{SEARCH_PATH}?{urlencode({'search': search})}"
+    try:
+        soup = await fetch_soup(url, client)
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Infopark search request failed, falling back to pagination: {e}")
+        return await _paginate_and_filter(search, client)
+
+    jobs, _ = _parse_listing_page(soup)
+
+    if _results_look_filtered(jobs, search):
+        return jobs
+
+    logger.info(
+        f"Infopark server-side search for '{search}' looks unfiltered "
+        f"(got generic results) — falling back to manual pagination."
+    )
+    return await _paginate_and_filter(search, client)
 
 
 async def fetch_detail(job: dict, client: httpx.AsyncClient) -> dict:
