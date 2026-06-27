@@ -10,12 +10,109 @@ from app.utils.http import fetch_soup, split_emails
 logger = logging.getLogger(__name__)
 
 
+# ── Boilerplate stripping ────────────────────────────────────────────────────
+# Infopark's site repeats the full header nav + footer on every page. The
+# fallback description extractor (soup.find("main"/"article"/...)) sometimes
+# has no clean match and ends up grabbing the whole page body, including this
+# boilerplate. We strip it out in two ways:
+#   1. Remove known nav/footer DOM elements before extracting text at all.
+#   2. As a safety net, regex-strip the known repeating header/footer block
+#      from whatever description text we end up with, in case it slipped
+#      through some other path.
+
+# Marks the start of the header nav block that always repeats verbatim.
+_HEADER_START_RE = re.compile(r"^\s*Home\s*\n?\s*About\b", re.I)
+
+# Marks the start of the footer block ("About Infopark" sidebar heading is
+# distinct from the in-body "About Infopark" link, so we anchor on the longer
+# repeating sequence that only appears in the footer).
+_FOOTER_START_RE = re.compile(
+    r"About Infopark\s*\n\s*Overview\s*\n\s*Governing Body\s*\n\s*Executive Council",
+    re.I,
+)
+
+# Individual nav/footer lines, used to filter line-by-line as a last resort.
+_BOILERPLATE_LINES = {
+    "home", "about", "overview", "governing body", "executive council",
+    "team infopark", "rti act 2005", "rts act 2012", "careers @ park centre",
+    "setup your business", "types of space", "how to apply for space",
+    "benefits", "client service", "amenities", "shuttle services",
+    "company login", "companies@infopark", "company a-z listing",
+    "jobs@infopark", "resources", "media kit", "media hub", "downloads",
+    "tenders", "infopark newsletter", "contact", "job opportunities",
+    "career opportunities", "back", "about infopark", "infrastructure",
+    "infopark kochi phase 1", "infopark kochi phase 2", "infopark thrissur",
+    "infopark cherthala", "resource", "quick links", "ecosystem",
+    "new initiatives", "testimonials", "companies", "job search",
+    "contact us", "infoparks kerala,",
+}
+
+
+def _strip_boilerplate(raw: str) -> str:
+    """Remove the repeating Infopark header-nav and footer block from text."""
+    if not raw:
+        return raw
+
+    text = raw
+
+    # Cut everything from the footer marker onward (footer always trails the
+    # real content).
+    footer_match = _FOOTER_START_RE.search(text)
+    if footer_match:
+        text = text[: footer_match.start()]
+
+    # Cut a leading header-nav block if present at the very start.
+    if _HEADER_START_RE.match(text):
+        # Header nav ends right before the company name / "Job Description"
+        # heading. Find the first occurrence of a phone number, email, or the
+        # literal "Job Description" heading, and cut everything before it.
+        cut_markers = list(re.finditer(
+            r"(Job Description\b|[\w.+-]+@[\w-]+\.[\w.]+|\+?\d[\d\s\-]{8,}\d)",
+            text,
+        ))
+        if cut_markers:
+            text = text[cut_markers[0].start():]
+
+    # Line-level cleanup: some short generic words (e.g. "Benefits",
+    # "Contact", "Resources") appear BOTH as nav items and as legitimate
+    # section headers inside real job descriptions ("Your benefits" section,
+    # "Contact us" sign-off). To avoid false positives, we only drop a run of
+    # boilerplate lines when several of them appear *consecutively* — i.e. it
+    # looks like an actual nav list, not an isolated heading in real content.
+    lines = text.split("\n")
+    is_boiler = [ln.strip().lower().rstrip(":") in _BOILERPLATE_LINES for ln in lines]
+
+    cleaned = []
+    i = 0
+    n = len(lines)
+    MIN_RUN = 3  # require at least 3 consecutive boilerplate-looking lines
+    while i < n:
+        if is_boiler[i]:
+            j = i
+            while j < n and is_boiler[j]:
+                j += 1
+            run_len = j - i
+            if run_len >= MIN_RUN:
+                i = j  # skip the whole run — it's a real nav block
+                continue
+            else:
+                cleaned.extend(lines[i:j])  # keep short runs — likely real content
+                i = j
+                continue
+        cleaned.append(lines[i])
+        i += 1
+    text = "\n".join(cleaned)
+
+    # Collapse excess blank lines left behind by removed boilerplate.
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
 async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
     """Fetch the Infopark job-search page and parse the results table."""
     url = f"{settings.infopark_base}/companies/job-search?{urlencode({'search': search})}"
     soup = await fetch_soup(url, client)
     jobs = []
-
     for row in soup.find_all("tr"):
         link = row.find("a", href=re.compile(r"/company-jobs/details/\d+/\d+"))
         if not link:
@@ -40,6 +137,13 @@ async def fetch_detail(job: dict, client: httpx.AsyncClient) -> dict:
     """Fetch an Infopark job detail page and extract all fields."""
     url = urljoin(settings.infopark_base, job["detail_path"])
     soup = await fetch_soup(url, client)
+
+    # Work on a copy of the tree with nav/footer elements removed up front,
+    # so neither the description extraction nor the plain-text fallback can
+    # accidentally pick up boilerplate.
+    for tag in soup.find_all(["nav", "header", "footer"]):
+        tag.decompose()
+
     text = soup.get_text(separator=" ", strip=True)
 
     contact_phone = None
@@ -77,6 +181,10 @@ async def fetch_detail(job: dict, client: httpx.AsyncClient) -> dict:
         )
         if main_tag:
             description = main_tag.get_text(separator="\n", strip=True) or None
+
+    # Final safety net: strip any nav/footer text that still made it through,
+    # regardless of which extraction path produced `description`.
+    description = _strip_boilerplate(description) if description else None
 
     return {
         "job_id": job["job_id"],
