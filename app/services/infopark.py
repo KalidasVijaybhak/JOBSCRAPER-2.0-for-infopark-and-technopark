@@ -1,6 +1,7 @@
 import re
+import asyncio
 import logging
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urljoin
 
 import httpx
 
@@ -10,28 +11,12 @@ from app.utils.http import fetch_soup, split_emails
 logger = logging.getLogger(__name__)
 
 
-# ── Boilerplate stripping ────────────────────────────────────────────────────
-# Infopark's site repeats the full header nav + footer on every page. The
-# fallback description extractor (soup.find("main"/"article"/...)) sometimes
-# has no clean match and ends up grabbing the whole page body, including this
-# boilerplate. We strip it out in two ways:
-#   1. Remove known nav/footer DOM elements before extracting text at all.
-#   2. As a safety net, regex-strip the known repeating header/footer block
-#      from whatever description text we end up with, in case it slipped
-#      through some other path.
-
-# Marks the start of the header nav block that always repeats verbatim.
+# ── Boilerplate stripping (unchanged from previous fix) ─────────────────────
 _HEADER_START_RE = re.compile(r"^\s*Home\s*\n?\s*About\b", re.I)
-
-# Marks the start of the footer block ("About Infopark" sidebar heading is
-# distinct from the in-body "About Infopark" link, so we anchor on the longer
-# repeating sequence that only appears in the footer).
 _FOOTER_START_RE = re.compile(
     r"About Infopark\s*\n\s*Overview\s*\n\s*Governing Body\s*\n\s*Executive Council",
     re.I,
 )
-
-# Individual nav/footer lines, used to filter line-by-line as a last resort.
 _BOILERPLATE_LINES = {
     "home", "about", "overview", "governing body", "executive council",
     "team infopark", "rti act 2005", "rts act 2012", "careers @ park centre",
@@ -49,69 +34,58 @@ _BOILERPLATE_LINES = {
 
 
 def _strip_boilerplate(raw: str) -> str:
-    """Remove the repeating Infopark header-nav and footer block from text."""
     if not raw:
         return raw
-
     text = raw
-
-    # Cut everything from the footer marker onward (footer always trails the
-    # real content).
     footer_match = _FOOTER_START_RE.search(text)
     if footer_match:
         text = text[: footer_match.start()]
-
-    # Cut a leading header-nav block if present at the very start.
     if _HEADER_START_RE.match(text):
-        # Header nav ends right before the company name / "Job Description"
-        # heading. Find the first occurrence of a phone number, email, or the
-        # literal "Job Description" heading, and cut everything before it.
         cut_markers = list(re.finditer(
             r"(Job Description\b|[\w.+-]+@[\w-]+\.[\w.]+|\+?\d[\d\s\-]{8,}\d)",
             text,
         ))
         if cut_markers:
             text = text[cut_markers[0].start():]
-
-    # Line-level cleanup: some short generic words (e.g. "Benefits",
-    # "Contact", "Resources") appear BOTH as nav items and as legitimate
-    # section headers inside real job descriptions ("Your benefits" section,
-    # "Contact us" sign-off). To avoid false positives, we only drop a run of
-    # boilerplate lines when several of them appear *consecutively* — i.e. it
-    # looks like an actual nav list, not an isolated heading in real content.
     lines = text.split("\n")
     is_boiler = [ln.strip().lower().rstrip(":") in _BOILERPLATE_LINES for ln in lines]
-
     cleaned = []
-    i = 0
-    n = len(lines)
-    MIN_RUN = 3  # require at least 3 consecutive boilerplate-looking lines
+    i, n, MIN_RUN = 0, len(lines), 3
     while i < n:
         if is_boiler[i]:
             j = i
             while j < n and is_boiler[j]:
                 j += 1
-            run_len = j - i
-            if run_len >= MIN_RUN:
-                i = j  # skip the whole run — it's a real nav block
-                continue
-            else:
-                cleaned.extend(lines[i:j])  # keep short runs — likely real content
+            if j - i >= MIN_RUN:
                 i = j
                 continue
+            cleaned.extend(lines[i:j])
+            i = j
+            continue
         cleaned.append(lines[i])
         i += 1
     text = "\n".join(cleaned)
-
-    # Collapse excess blank lines left behind by removed boilerplate.
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
 
-async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
-    """Fetch the Infopark job-search page and parse the results table."""
-    url = f"{settings.infopark_base}/companies/job-search?{urlencode({'search': search})}"
-    soup = await fetch_soup(url, client)
+# ── Listing ───────────────────────────────────────────────────────────────────
+# Infopark moved the job board from /companies/job-search?search=<term> to
+# /companies-job (paginated via ?page=N) and the `search` query param is no
+# longer honored server-side — every page renders the same unfiltered list
+# regardless of what `search` is set to. The page also has no working HTML
+# search form; filtering is JS-only on the client.
+#
+# Fix: paginate through /companies-job ourselves and filter by keyword against
+# the job title AND company name in Python, the same approach already used
+# for Technopark's /job-crawl page.
+
+LISTING_PATH = "/companies-job"
+MAX_PAGES_TO_SCAN = 30  # site currently has ~27 pages; cap as a safety bound
+
+
+def _parse_listing_page(soup) -> tuple[list[dict], bool]:
+    """Parse one listing page's table rows. Returns (jobs, has_more_pages)."""
     jobs = []
     for row in soup.find_all("tr"):
         link = row.find("a", href=re.compile(r"/company-jobs/details/\d+/\d+"))
@@ -130,7 +104,64 @@ async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
             "last_date_to_apply": cells[3].get_text(strip=True) if len(cells) > 3 else None,
             "detail_path": link["href"],
         })
-    return jobs
+
+    # Determine if there's a next page. IMPORTANT: the pager shows numbered
+    # links back to EARLIER pages even when viewing the LAST page (e.g. on
+    # page 27 of 27, you still see links to pages 1-26), so checking for "any
+    # link matching ?page=\d+" is unreliable and never correctly detects the
+    # end. Instead we check specifically for the "›" (next) arrow being an
+    # active link with an href — on the last page it renders as plain text
+    # with no href, on every other page it's a real link to page+1.
+    has_more = False
+    for a in soup.find_all("a", href=re.compile(r"companies-job(\?page=\d+)?$")):
+        label = a.get_text(strip=True)
+        if label in ("›", "»", "next", "Next"):
+            has_more = True
+            break
+    return jobs, has_more
+
+
+async def get_listing(search: str, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Fetch ALL pages of /companies-job and filter rows whose job title or
+    company name contains the search keyword (case-insensitive substring).
+    Stops early once a page with no matching jobs AND no next-page link is
+    reached, or once MAX_PAGES_TO_SCAN is hit.
+    """
+    keyword = search.lower().strip()
+    matched: list[dict] = []
+    seen_job_ids: set[str] = set()
+
+    page = 1
+    while page <= MAX_PAGES_TO_SCAN:
+        url = (
+            f"{settings.infopark_base}{LISTING_PATH}"
+            if page == 1
+            else f"{settings.infopark_base}{LISTING_PATH}?page={page}"
+        )
+        try:
+            soup = await fetch_soup(url, client)
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"Infopark listing page {page} failed: {e}")
+            break
+
+        jobs, has_more = _parse_listing_page(soup)
+        if not jobs:
+            break  # ran past the last page
+
+        for job in jobs:
+            if job["job_id"] in seen_job_ids:
+                continue
+            seen_job_ids.add(job["job_id"])
+            haystack = f"{job['title']} {job['company']}".lower()
+            if not keyword or keyword in haystack:
+                matched.append(job)
+
+        if not has_more:
+            break
+        page += 1
+
+    return matched
 
 
 async def fetch_detail(job: dict, client: httpx.AsyncClient) -> dict:
@@ -138,9 +169,6 @@ async def fetch_detail(job: dict, client: httpx.AsyncClient) -> dict:
     url = urljoin(settings.infopark_base, job["detail_path"])
     soup = await fetch_soup(url, client)
 
-    # Work on a copy of the tree with nav/footer elements removed up front,
-    # so neither the description extraction nor the plain-text fallback can
-    # accidentally pick up boilerplate.
     for tag in soup.find_all(["nav", "header", "footer"]):
         tag.decompose()
 
@@ -182,8 +210,6 @@ async def fetch_detail(job: dict, client: httpx.AsyncClient) -> dict:
         if main_tag:
             description = main_tag.get_text(separator="\n", strip=True) or None
 
-    # Final safety net: strip any nav/footer text that still made it through,
-    # regardless of which extraction path produced `description`.
     description = _strip_boilerplate(description) if description else None
 
     return {
